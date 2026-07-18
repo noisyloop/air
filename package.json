@@ -1,0 +1,29 @@
+{
+  "name": "air",
+  "private": true,
+  "version": "0.1.0",
+  "description": "air — a full-stack music streaming platform (educational / portfolio reference)",
+  "license": "MIT",
+  "workspaces": [
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "docker compose up -d postgres redis minio meilisearch && npm run dev --workspaces --if-present",
+    "dev:api": "npm run dev -w @air/api",
+    "dev:worker": "npm run dev:worker -w @air/api",
+    "dev:web": "npm run dev -w @air/web",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "db:migrate": "npm run db:migrate -w @air/api",
+    "db:seed": "npm run db:seed -w @air/api",
+    "format": "prettier --write \"**/*.{ts,tsx,md,json,yml}\""
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3"
+  }
+}
