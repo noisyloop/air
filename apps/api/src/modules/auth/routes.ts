@@ -18,19 +18,23 @@ const loginSchema = z.object({
   password: z.string().min(1).max(128),
 });
 
+// Path is '/' (not '/auth') so the cookie survives path-prefixing proxies
+// (e.g. the dev server mounts the API under /api). The API only reads it on
+// /auth/refresh and /auth/logout; it is HttpOnly + SameSite so exposure is
+// unchanged.
 function setRefreshCookie(reply: FastifyReply, token: string): void {
   reply.setCookie(REFRESH_COOKIE, token, {
     httpOnly: true,
     secure: config.COOKIE_SECURE,
     sameSite: 'lax',
     domain: config.COOKIE_DOMAIN,
-    path: '/auth',
+    path: '/',
     maxAge: config.REFRESH_TOKEN_TTL_DAYS * 86_400,
   });
 }
 
 function clearRefreshCookie(reply: FastifyReply): void {
-  reply.clearCookie(REFRESH_COOKIE, { path: '/auth', domain: config.COOKIE_DOMAIN });
+  reply.clearCookie(REFRESH_COOKIE, { path: '/', domain: config.COOKIE_DOMAIN });
 }
 
 const meta = (req: FastifyRequest) => ({ ip: req.ip, userAgent: req.headers['user-agent'] });
