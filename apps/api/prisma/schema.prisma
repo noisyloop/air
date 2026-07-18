@@ -1,0 +1,602 @@
+// air — database schema
+// Normalized catalog + auth + social + pipeline + analytics tables.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth & authorization
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  displayName  String
+  avatarKey    String?
+  bio          String?
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  roles              UserRole[]
+  authSessions       AuthSession[]
+  apiKeys            ApiKey[]
+  artistProfile      Artist?             @relation("ArtistOwner")
+  playlists          Playlist[]
+  playlistCollabs    PlaylistCollaborator[]
+  playlistAdditions  PlaylistTrack[]     @relation("AddedBy")
+  favorites          Favorite[]
+  history            History[]
+  listeningSessions  ListeningSession[]
+  uploadJobs         UploadJob[]
+  reviewedUploads    UploadJob[]         @relation("UploadReviewer")
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+  searchQueries      SearchQuery[]
+  libraryFolders     LibraryFolder[]
+  playlistPins       PlaylistPin[]
+  playbackState      PlaybackState?
+  following          Follow[]            @relation("FollowerUser")
+  followers          Follow[]            @relation("FollowedUser")
+}
+
+model Role {
+  id          String           @id @default(cuid())
+  name        String           @unique // listener | artist | moderator | admin
+  description String?
+  users       UserRole[]
+  permissions RolePermission[]
+}
+
+model Permission {
+  id    String           @id @default(cuid())
+  key   String           @unique // e.g. "track:upload", "admin:users"
+  roles RolePermission[]
+}
+
+model UserRole {
+  userId String
+  roleId String
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+// Rotating refresh-token sessions. Token stored hashed; `family` links rotations
+// so refresh-token reuse (theft) revokes the whole chain.
+model AuthSession {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  family     String
+  ip         String?
+  userAgent  String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  rotatedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@index([family])
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  keyHash    String    @unique
+  prefix     String // first chars shown in UI, e.g. "air_k1_ab12"
+  scopes     String[] // permission keys granted to this key
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action     String // e.g. "upload.approve", "user.suspend"
+  targetType String?
+  targetId   String?
+  metadata   Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Artist {
+  id               String   @id @default(cuid())
+  name             String
+  slug             String   @unique
+  bio              String?
+  imageKey         String?
+  verified         Boolean  @default(false)
+  // Denormalized rollup, recomputed by the worker from History.
+  monthlyListeners Int      @default(0)
+  ownerUserId      String?  @unique
+  owner            User?    @relation("ArtistOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  albums     Album[]
+  tracks     Track[]
+  genres     ArtistGenre[]
+  followers  Follow[]      @relation("FollowedArtist")
+  favorites  Favorite[]
+  uploadJobs UploadJob[]
+  dailyStats DailyStat[]
+}
+
+enum AlbumType {
+  ALBUM
+  SINGLE
+  EP
+  COMPILATION
+}
+
+model Album {
+  id          String    @id @default(cuid())
+  artistId    String
+  artist      Artist    @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  title       String
+  slug        String    @unique
+  type        AlbumType @default(ALBUM)
+  releaseDate DateTime?
+  label       String?
+  upc         String?
+  // Denormalized popularity 0-100, recomputed by the worker.
+  popularity  Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tracks    Track[]
+  art       AlbumArt[]
+  genres    AlbumGenre[]
+  favorites Favorite[]
+
+  @@index([artistId])
+}
+
+// Multiple rendered sizes of the album cover, stored in the art bucket.
+model AlbumArt {
+  id        String   @id @default(cuid())
+  albumId   String
+  album     Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  size      Int // square edge px: 64, 300, 640, 0 = original
+  objectKey String
+  width     Int
+  height    Int
+  createdAt DateTime @default(now())
+
+  @@unique([albumId, size])
+}
+
+model Track {
+  id           String   @id @default(cuid())
+  albumId      String
+  album        Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  artistId     String
+  artist       Artist   @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  title        String
+  slug         String   @unique
+  trackNumber  Int      @default(1)
+  discNumber   Int      @default(1)
+  durationMs   Int      @default(0)
+  explicit     Boolean  @default(false)
+  isrc         String?
+  // Credits: [{role: "producer", name: "..."}, ...]
+  credits      Json?
+  lyrics       String?
+  // EBU R128 integrated loudness, for replay-gain style normalization.
+  loudnessLufs Float?
+  waveformKey  String? // object key of waveform peaks JSON
+  playCount    BigInt   @default(0)
+  // Denormalized popularity 0-100, recomputed by the worker.
+  popularity   Int      @default(0)
+  publishedAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  files          TrackFile[]
+  variants       AudioVariant[]
+  genres         TrackGenre[]
+  playlistTracks PlaylistTrack[]
+  favorites      Favorite[]
+  history        History[]
+  uploadJob      UploadJob?
+  dailyStats     DailyStat[]
+
+  @@index([albumId])
+  @@index([artistId])
+  @@index([popularity])
+}
+
+// Original uploaded masters (never streamed directly).
+model TrackFile {
+  id        String   @id @default(cuid())
+  trackId   String
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  objectKey String
+  mimeType  String
+  sizeBytes BigInt
+  sha256    String?
+  createdAt DateTime @default(now())
+
+  @@index([trackId])
+}
+
+enum AudioFormat {
+  AAC
+  OPUS
+  MP3
+  WAV
+}
+
+// Streamable encodes produced by the worker.
+model AudioVariant {
+  id          String      @id @default(cuid())
+  trackId     String
+  track       Track       @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  format      AudioFormat
+  bitrateKbps Int
+  objectKey   String
+  sizeBytes   BigInt
+  createdAt   DateTime    @default(now())
+
+  @@unique([trackId, format, bitrateKbps])
+}
+
+model Genre {
+  id      String        @id @default(cuid())
+  name    String        @unique
+  slug    String        @unique
+  tracks  TrackGenre[]
+  albums  AlbumGenre[]
+  artists ArtistGenre[]
+}
+
+model TrackGenre {
+  trackId String
+  genreId String
+  track   Track @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  genre   Genre @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([trackId, genreId])
+}
+
+model AlbumGenre {
+  albumId String
+  genreId String
+  album   Album @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  genre   Genre @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([albumId, genreId])
+}
+
+model ArtistGenre {
+  artistId String
+  genreId  String
+  artist   Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  genre    Genre  @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([artistId, genreId])
+}
+
+// ---------------------------------------------------------------------------
+// Playlists & library
+// ---------------------------------------------------------------------------
+
+model Playlist {
+  id              String   @id @default(cuid())
+  ownerId         String
+  owner           User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  title           String
+  description     String?
+  coverKey        String?
+  isPublic        Boolean  @default(false)
+  isCollaborative Boolean  @default(false)
+  // Share slug for public links.
+  shareId         String   @unique @default(cuid())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tracks        PlaylistTrack[]
+  collaborators PlaylistCollaborator[]
+  favorites     Favorite[]
+  folderItems   LibraryFolderItem[]
+  pins          PlaylistPin[]
+
+  @@index([ownerId])
+}
+
+model PlaylistTrack {
+  id         String   @id @default(cuid())
+  playlistId String
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  trackId    String
+  track      Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  position   Int
+  addedById  String?
+  addedBy    User?    @relation("AddedBy", fields: [addedById], references: [id], onDelete: SetNull)
+  addedAt    DateTime @default(now())
+
+  @@unique([playlistId, trackId])
+  @@index([playlistId, position])
+}
+
+// Per-user pinned playlists (shown at the top of the library sidebar).
+model PlaylistPin {
+  userId     String
+  playlistId String
+  position   Int      @default(0)
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+
+  @@id([userId, playlistId])
+}
+
+model PlaylistCollaborator {
+  playlistId String
+  userId     String
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  addedAt    DateTime @default(now())
+
+  @@id([playlistId, userId])
+}
+
+enum FavoriteType {
+  TRACK
+  ALBUM
+  ARTIST
+  PLAYLIST
+}
+
+// Polymorphic favorite with one non-null target FK enforced in service layer
+// (+ partial unique indexes added in the migration).
+model Favorite {
+  id         String       @id @default(cuid())
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type       FavoriteType
+  trackId    String?
+  track      Track?       @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  albumId    String?
+  album      Album?       @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  artistId   String?
+  artist     Artist?      @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  playlistId String?
+  playlist   Playlist?    @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  createdAt  DateTime     @default(now())
+
+  @@index([userId, type, createdAt])
+}
+
+model LibraryFolder {
+  id        String              @id @default(cuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  position  Int                 @default(0)
+  createdAt DateTime            @default(now())
+  items     LibraryFolderItem[]
+
+  @@index([userId])
+}
+
+model LibraryFolderItem {
+  folderId   String
+  playlistId String
+  position   Int           @default(0)
+  folder     LibraryFolder @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  playlist   Playlist      @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+
+  @@id([folderId, playlistId])
+}
+
+// Follows: exactly one of followedUserId / artistId set (service-enforced,
+// partial unique indexes in migration).
+model Follow {
+  id             String   @id @default(cuid())
+  followerId     String
+  follower       User     @relation("FollowerUser", fields: [followerId], references: [id], onDelete: Cascade)
+  followedUserId String?
+  followedUser   User?    @relation("FollowedUser", fields: [followedUserId], references: [id], onDelete: Cascade)
+  artistId       String?
+  artist         Artist?  @relation("FollowedArtist", fields: [artistId], references: [id], onDelete: Cascade)
+  createdAt      DateTime @default(now())
+
+  @@index([followerId])
+  @@index([artistId])
+  @@index([followedUserId])
+}
+
+// ---------------------------------------------------------------------------
+// Playback, history & sessions
+// ---------------------------------------------------------------------------
+
+enum PlaySource {
+  ALBUM
+  PLAYLIST
+  SEARCH
+  RADIO
+  LIBRARY
+  QUEUE
+  RECOMMENDATION
+  OTHER
+}
+
+model History {
+  id        String     @id @default(cuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trackId   String
+  track     Track      @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  playedAt  DateTime   @default(now())
+  msPlayed  Int        @default(0)
+  completed Boolean    @default(false)
+  source    PlaySource @default(OTHER)
+  contextId String? // playlist/album id the play came from
+
+  @@index([userId, playedAt])
+  @@index([trackId, playedAt])
+}
+
+model ListeningSession {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceName  String?
+  ip          String?
+  userAgent   String?
+  startedAt   DateTime  @default(now())
+  lastSeenAt  DateTime  @default(now())
+  endedAt     DateTime?
+  msListened  Int       @default(0)
+  bytesServed BigInt    @default(0)
+
+  @@index([userId, startedAt])
+}
+
+// One row per user: where to resume playback after reconnect.
+model PlaybackState {
+  userId     String   @id
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trackId    String?
+  positionMs Int      @default(0)
+  queue      Json? // ordered track ids + context
+  updatedAt  DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Upload pipeline
+// ---------------------------------------------------------------------------
+
+enum UploadStatus {
+  PENDING
+  UPLOADED
+  PROCESSING
+  AWAITING_APPROVAL
+  READY
+  FAILED
+  REJECTED
+}
+
+model UploadJob {
+  id               String       @id @default(cuid())
+  userId           String
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  artistId         String
+  artist           Artist       @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  trackId          String?      @unique
+  track            Track?       @relation(fields: [trackId], references: [id], onDelete: SetNull)
+  status           UploadStatus @default(PENDING)
+  objectKey        String // original file in uploads bucket
+  originalFilename String
+  declaredMime     String
+  sizeBytes        BigInt       @default(0)
+  // Submitted metadata: title, albumTitle, genres, artwork key, rights attestation...
+  metadata         Json
+  error            String?
+  reviewedById     String?
+  reviewedBy       User?        @relation("UploadReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt       DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications, search & analytics
+// ---------------------------------------------------------------------------
+
+enum NotificationType {
+  NEW_RELEASE
+  PLAYLIST_FOLLOW
+  PLAYLIST_COLLAB
+  NEW_FOLLOWER
+  UPLOAD_STATUS
+  SYSTEM
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String?
+  data      Json?
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+}
+
+// Raw search log — powers "trending searches" and "most searched" analytics.
+model SearchQuery {
+  id          String   @id @default(cuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  query       String
+  resultCount Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([query])
+  @@index([createdAt])
+}
+
+// Daily rollups written by the worker. Global rows have null track/artist.
+model DailyStat {
+  id            String   @id @default(cuid())
+  date          DateTime @db.Date
+  trackId       String?
+  track         Track?   @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  artistId      String?
+  artist        Artist?  @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  plays         Int      @default(0)
+  uniqueUsers   Int      @default(0)
+  msPlayed      BigInt   @default(0)
+  bytesServed   BigInt   @default(0)
+  uploads       Int      @default(0)
+  searches      Int      @default(0)
+  newUsers      Int      @default(0)
+  activeUsers   Int      @default(0)
+
+  @@unique([date, trackId, artistId])
+  @@index([date])
+}
